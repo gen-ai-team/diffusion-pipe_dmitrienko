@@ -5,7 +5,7 @@ import re
 import os.path
 
 sys.path.insert(
-    0, os.path.join(os.path.abspath(os.path.dirname(__file__)), "../submodules/Wan2_1")
+    0, os.path.join(os.path.abspath(os.path.dirname(__file__)), "../submodules/Wan2_1_dmitrienko")
 )
 
 import torch

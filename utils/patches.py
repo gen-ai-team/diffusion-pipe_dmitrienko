@@ -16,8 +16,8 @@ from deepspeed.runtime.pipe.schedule import (
 from deepspeed import comm as dist
 from deepspeed.utils import groups
 
-import hyvideo.text_encoder
-from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+# import hyvideo.text_encoder
+# from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
@@ -206,7 +206,7 @@ def apply_patches(multilora_patch=False):
     peft.tuners.tuners_utils.BaseTunerLayer._move_adapter_to_device_of_base_layer = _move_adapter_to_device_of_base_layer
 
     # Use torch_dtype to avoid needlessly loading the text encoder in float32, only to cast it right after.
-    hyvideo.text_encoder.load_text_encoder = load_text_encoder
+    # hyvideo.text_encoder.load_text_encoder = load_text_encoder
 
     # LoadMicroBatch before sending / receiving activations so we can avoid a deadlock and broadcast the target
     # from the first stage to the last stage. InferenceSchedule already has the commands in the right order
