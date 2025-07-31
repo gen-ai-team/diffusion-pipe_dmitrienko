@@ -29,6 +29,8 @@ from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 
+MULTILORA_PATCH = True
+
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 parser = argparse.ArgumentParser()
@@ -62,7 +64,7 @@ ds_pipe_module.PipelineModule._count_layer_params = _count_all_layer_params
 
 def set_config_defaults(config):
     # Force the user to set this. If we made it a default of 1, it might use a lot of disk space.
-    assert 'save_every_n_epochs' in config
+    assert 'save_every_n_epochs' in config or 'save_every_n_steps' in config
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
@@ -82,17 +84,19 @@ def set_config_defaults(config):
         adapter_config = config['adapter']
         adapter_type = adapter_config['type']
         if adapter_config['type'] == 'lora':
-            if 'alpha' in adapter_config:
-                raise NotImplementedError(
-                    'This script forces alpha=rank to make the saved LoRA format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
-                )
-            adapter_config['alpha'] = adapter_config['rank']
+            # if 'alpha' in adapter_config:
+            #     raise NotImplementedError(
+            #         'This script forces alpha=rank to make the saved LoRA format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
+            #     )
+            if 'alpha' not in adapter_config:
+                adapter_config['alpha'] = adapter_config['rank']
+
             adapter_config.setdefault('dropout', 0.0)
             adapter_config.setdefault('dtype', model_dtype_str)
             adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-
+        print(f"\n\Create adapter_config: {adapter_config}\n\n")
     config.setdefault('logging_steps', 1)
     config.setdefault('eval_datasets', [])
     config.setdefault('eval_gradient_accumulation_steps', 1)
@@ -204,10 +208,7 @@ def get_prodigy_d(optimizer):
         d += group['d']
     return d / len(optimizer.param_groups)
 
-
 if __name__ == '__main__':
-    apply_patches()
-
     # needed for broadcasting Queue in dataset.py
     mp.current_process().authkey = b'afsaskgfdjh4'
 
@@ -216,6 +217,7 @@ if __name__ == '__main__':
         config = json.loads(json.dumps(toml.load(f)))
 
     set_config_defaults(config)
+    apply_patches(multilora_patch=bool('old_adapter' in config ))
     common.AUTOCAST_DTYPE = config['model']['dtype']
 
     # Initialize distributed environment before deepspeed
@@ -374,7 +376,48 @@ if __name__ == '__main__':
         quit()
 
     model.load_diffusion_model()
+    if old_adapter_config := config.get('old_adapter', None):
+        from peft import PeftModel, LoraConfig, get_peft_model
+        from safetensors.torch import load_file
+        adapter_config = LoraConfig.from_pretrained(old_adapter_config['lora_path'])
+        adapter_name = 'nocfg'
+        # model = PeftModel.from_pretrained(model, old_adapter_config['lora_path'], is_trainable=False)
+        model.transformer = get_peft_model(
+            model.transformer, adapter_config,
+            adapter_name=adapter_name,
+        )
+        # Загрузка весов адаптера
+        adapter_path = os.path.join(old_adapter_config['lora_path'], 'adapter_model.safetensors')
+        adapter_state_dict = load_file(adapter_path)
+        
+        # Нормализация ключей (только там где есть lora)
+        normalized_state_dict = {}
+        num_i = 0
+        
+        for k, v in adapter_state_dict.items():
+            if 'lora' in k  :
+                new_key = k
+                
+                if "diffusion_model." in new_key:
+                    if  "base_model.model." not in new_key:
+                        new_key = new_key.replace("diffusion_model.", "base_model.model.")
+                    else:
+                        new_key = new_key.replace("diffusion_model.", "")
+                if (
+                    (".default.weight" not in new_key and f".{adapter_name}.weight" not in new_key)
+                    and  (new_key.split(".")[-2] == 'lora_A' or new_key.split(".")[-2] == 'lora_B')
+                ):
+                    new_key = new_key.replace(".weight", f".{adapter_name}.weight")
 
+                elif  f".{adapter_name}.weight" not in new_key and ".default.weight" in new_key:
+                    new_key = new_key.replace(".default.weight", f".{adapter_name}.weight")
+                    
+                normalized_state_dict[new_key] = v
+                num_i += 1
+
+        for key, value in normalized_state_dict.items():
+            model.transformer.state_dict()[key].copy_(value)
+    # print( model.transformer)
     if adapter_config := config.get('adapter', None):
         init_from_existing = adapter_config.get('init_from_existing', None)
         # SDXL is special. LoRAs are saved in Kohya sd-scripts format, which is very difficult to load the state_dict into
@@ -387,7 +430,7 @@ if __name__ == '__main__':
             model.load_adapter_weights(init_from_existing)
     else:
         is_adapter = False
-
+    print(f'model after 2 loras:', model.transformer)
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
         run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
@@ -401,9 +444,15 @@ if __name__ == '__main__':
         run_dir = os.path.join(config['output_dir'], resume_from_checkpoint)
         if not os.path.exists(run_dir):
             raise ValueError(f"Checkpoint directory {run_dir} does not exist")
-    else:  # Not resuming, use most recent (newly created) dir
-        run_dir = get_most_recent_run_dir(config['output_dir'])
-
+    # else:  # Not resuming, use most recent (newly created) dir
+    #     run_dir = get_most_recent_run_dir(config['output_dir'])
+    if run_dir.endswith('training_log.txt'):
+        run_dir = run_dir.replace('training_log.txt', '')
+    if not run_dir.split('-')[-1].isdigit():
+        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+    os.makedirs(run_dir, exist_ok=True)
+    shutil.copy(args.config, run_dir)
+    print(f'run_dir={run_dir} after init')
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
@@ -619,7 +668,8 @@ if __name__ == '__main__':
     }
 
     epoch = train_dataloader.epoch
-    tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
+    print(f'run_dir={run_dir}')
+    tb_writer = SummaryWriter(log_dir=run_dir + '_tb') if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)

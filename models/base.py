@@ -11,7 +11,14 @@ from PIL import Image, ImageOps
 from torchvision import transforms
 import imageio
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
+
+
+from utils.common import (
+    is_main_process,
+    VIDEO_EXTENSIONS,
+    round_to_nearest_multiple,
+    round_down_to_multiple,
+)
 
 
 def make_contiguous(*tensors):
@@ -23,46 +30,60 @@ def extract_clips(video, target_frames, video_clip_mode):
     frames = video.shape[1]
     if frames < target_frames:
         # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
-        print(f'video with shape {video.shape} is being skipped because it has less than the target_frames')
+        print(
+            f"video with shape {video.shape} is being skipped because it has less than the target_frames"
+        )
         return []
 
-    if video_clip_mode == 'single_beginning':
+    if video_clip_mode == "single_beginning":
         return [video[:, :target_frames, ...]]
-    elif video_clip_mode == 'single_middle':
+    elif video_clip_mode == "single_middle":
         start = int((frames - target_frames) / 2)
-        assert frames-start >= target_frames
-        return [video[:, start:start+target_frames, ...]]
-    elif video_clip_mode == 'multiple_overlapping':
+        assert frames - start >= target_frames
+        return [video[:, start : start + target_frames, ...]]
+    elif video_clip_mode == "multiple_overlapping":
         # Extract multiple clips so we use the whole video for training.
         # The clips might overlap a little bit. We never cut anything off the end of the video.
         num_clips = ((frames - 1) // target_frames) + 1
-        start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-        return [video[:, i:i+target_frames, ...] for i in start_indices]
+        start_indices = torch.linspace(0, frames - target_frames, num_clips).int()
+        return [video[:, i : i + target_frames, ...] for i in start_indices]
     else:
-        raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
+        raise NotImplementedError(
+            f"video_clip_mode={video_clip_mode} is not recognized"
+        )
 
 
 def convert_crop_and_resize(pil_img, width_and_height):
-    if pil_img.mode not in ['RGB', 'RGBA'] and 'transparency' in pil_img.info:
-        pil_img = pil_img.convert('RGBA')
+    if pil_img.mode not in ["RGB", "RGBA"] and "transparency" in pil_img.info:
+        pil_img = pil_img.convert("RGBA")
 
     # add white background for transparent images
-    if pil_img.mode == 'RGBA':
-        canvas = Image.new('RGBA', pil_img.size, (255, 255, 255))
+    if pil_img.mode == "RGBA":
+        canvas = Image.new("RGBA", pil_img.size, (255, 255, 255))
         canvas.alpha_composite(pil_img)
-        pil_img = canvas.convert('RGB')
+        pil_img = canvas.convert("RGB")
     else:
-        pil_img = pil_img.convert('RGB')
+        pil_img = pil_img.convert("RGB")
 
     return ImageOps.fit(pil_img, width_and_height)
 
 
 class PreprocessMediaFile:
-    def __init__(self, config, support_video=False, framerate=None, round_height=1, round_width=1, round_frames=1):
+    def __init__(
+        self,
+        config,
+        support_video=False,
+        framerate=None,
+        round_height=1,
+        round_width=1,
+        round_frames=1,
+    ):
         self.config = config
-        self.video_clip_mode = config.get('video_clip_mode', 'single_beginning')
-        print(f'using video_clip_mode={self.video_clip_mode}')
-        self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+        self.video_clip_mode = config.get("video_clip_mode", "single_beginning")
+        print(f"using video_clip_mode={self.video_clip_mode}")
+        self.pil_to_tensor = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+        )
         self.support_video = support_video
         self.framerate = framerate
         self.round_height = round_height
@@ -72,7 +93,7 @@ class PreprocessMediaFile:
             assert self.framerate
 
     def __call__(self, filepath, mask_filepath, size_bucket=None):
-        is_video = (Path(filepath).suffix in VIDEO_EXTENSIONS)
+        is_video = Path(filepath).suffix in VIDEO_EXTENSIONS
         if is_video:
             assert self.support_video
             num_frames = 0
@@ -89,25 +110,35 @@ class PreprocessMediaFile:
         if size_bucket is not None:
             size_bucket_width, size_bucket_height, size_bucket_frames = size_bucket
         else:
-            size_bucket_width, size_bucket_height, size_bucket_frames = width, height, num_frames
+            size_bucket_width, size_bucket_height, size_bucket_frames = (
+                width,
+                height,
+                num_frames,
+            )
 
-        height_rounded = round_to_nearest_multiple(size_bucket_height, self.round_height)
+        height_rounded = round_to_nearest_multiple(
+            size_bucket_height, self.round_height
+        )
         width_rounded = round_to_nearest_multiple(size_bucket_width, self.round_width)
-        frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
+        frames_rounded = (
+            round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
+        )
         resize_wh = (width_rounded, height_rounded)
 
         if mask_filepath:
-            mask_img = Image.open(mask_filepath).convert('RGB')
+            mask_img = Image.open(mask_filepath).convert("RGB")
             img_hw = (height, width)
             mask_hw = (mask_img.height, mask_img.width)
             if mask_hw != img_hw:
                 raise ValueError(
-                    f'Mask shape {mask_hw} was not the same as image shape {img_hw}.\n'
-                    f'Image path: {filepath}\n'
-                    f'Mask path: {mask_filepath}'
+                    f"Mask shape {mask_hw} was not the same as image shape {img_hw}.\n"
+                    f"Image path: {filepath}\n"
+                    f"Mask path: {mask_filepath}"
                 )
             mask_img = ImageOps.fit(mask_img, resize_wh)
-            mask = torchvision.transforms.functional.to_tensor(mask_img)[0].to(torch.float16)  # use first channel
+            mask = torchvision.transforms.functional.to_tensor(mask_img)[0].to(
+                torch.float16
+            )  # use first channel
         else:
             mask = None
 
@@ -152,48 +183,86 @@ class BasePipeline:
                     target_linear_modules.add(full_submodule_name)
         target_linear_modules = list(target_linear_modules)
 
-        adapter_type = adapter_config['type']
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=adapter_config['rank'],
-                lora_alpha=adapter_config['alpha'],
-                lora_dropout=adapter_config['dropout'],
-                bias='none',
-                target_modules=target_linear_modules
-            )
+        adapter_type = adapter_config["type"]
+        if adapter_type == "lora":
+            for target_modules in [self.adapter_target_modules, target_linear_modules,  ]:
+                #try:
+                print(f' self.adapter_target_modules={ self.adapter_target_modules}, target_linear_modules={target_linear_modules}')
+                peft_config = peft.LoraConfig(
+                    r=adapter_config["rank"],
+                    lora_alpha=adapter_config["alpha"],
+                    lora_dropout=adapter_config["dropout"],
+                    bias="none",
+                    target_modules=target_modules,
+                    inference_mode=False, 
+                )
+                self.peft_config = peft_config
+                if not isinstance(self.transformer, peft.PeftModel):
+                    self.lora_model = peft.get_peft_model(self.transformer, peft_config)
+                else:
+                    # self.transformer.add_adapter("camera", peft_config)
+                    # self.transformer.set_adapter("camera")
+                    self.lora_model = peft.get_peft_model(self.transformer, peft_config, adapter_name='default')
+                    # self.lora_model = self.transformer
+                    print("active_adapters", self.lora_model.active_adapters)
+                    print("all adapters", self.lora_model.peft_config.keys())
+                    for name, param in self.lora_model.named_parameters():
+                        if "default" in name and "lora" in name:
+                            param.requires_grad_(True)
+                        elif "nocfg" in name:
+                            param.requires_grad_(False)
+                    # self.lora_model.set_adapter([ "nocfg", "default",])
+                    # # 3. Альтернатива set_adapter() для нескольких адаптеров:
+                    # def set_multiple_adapters(model, adapter_names):
+                    #     for module in model.modules():
+                    #         if isinstance(module, peft.LoraLayer):
+                    #             if module.merged:
+                    #                 module.unmerge()
+                    #             module.set_adapter(adapter_names)
+                    #             module.active_adapters = adapter_names
+                    #     model.active_adapter = adapter_names
+                    #     model.active_adapters = adapter_names
+
+                    # # Устанавливаем оба адаптера активными
+                    # set_multiple_adapters(self.lora_model, ["nocfg", "camera", ])
+                    # print("active_adapters after set_multiple_adapters", self.lora_model.active_adapters)
+                break
+                # except Exception as e:
+                #     print(f'[models.base.configure_adapter] : {e}')
         else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(self.transformer, peft_config)
+            raise NotImplementedError(f"Adapter type {adapter_type} is not implemented")
+        
         if is_main_process():
             self.lora_model.print_trainable_parameters()
         for name, p in self.transformer.named_parameters():
             p.original_name = name
             if p.requires_grad:
-                p.data = p.data.to(adapter_config['dtype'])
+                p.data = p.data.to(adapter_config["dtype"])
 
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
 
     def load_adapter_weights(self, adapter_path):
         if is_main_process():
-            print(f'Loading adapter weights from path {adapter_path}')
-        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+            print(f"Loading adapter weights from path {adapter_path}")
+        safetensors_files = list(Path(adapter_path).glob("*.safetensors"))
         if len(safetensors_files) == 0:
-            raise RuntimeError(f'No safetensors file found in {adapter_path}')
+            raise RuntimeError(f"No safetensors file found in {adapter_path}")
         if len(safetensors_files) > 1:
-            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+            raise RuntimeError(f"Multiple safetensors files found in {adapter_path}")
         adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
         modified_state_dict = {}
         model_parameters = set(name for name, p in self.transformer.named_parameters())
         for k, v in adapter_state_dict.items():
             # Replace Diffusers or ComfyUI prefix
-            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+            k = re.sub(r"^(transformer|diffusion_model)\.", "", k)
             # Replace weight at end for LoRA format
-            k = re.sub(r'\.weight$', '.default.weight', k)
-            if k not in model_parameters:
-                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
-            modified_state_dict[k] = v
+            k = re.sub(r"\.weight$", ".default.weight", k)
+            if k in model_parameters:
+                modified_state_dict[k] = v
+            else:
+                print(f"modified_state_dict key {k} is not in the model parameters")
+
         self.transformer.load_state_dict(modified_state_dict, strict=False)
 
     def save_model(self, save_dir, diffusers_sd):
@@ -226,10 +295,10 @@ class BasePipeline:
     def get_loss_fn(self):
         def loss_fn(output, label):
             target, mask = label
-            with torch.autocast('cuda', enabled=False):
+            with torch.autocast("cuda", enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                loss = F.mse_loss(output, target, reduction='none')
+                loss = F.mse_loss(output, target, reduction="none")
                 # empty tensor means no masking
                 if mask.numel() > 0:
                     mask = mask.to(output.device, torch.float32)
@@ -239,7 +308,7 @@ class BasePipeline:
         return loss_fn
 
     def enable_block_swap(self, blocks_to_swap):
-        raise NotImplementedError('Block swapping is not implemented for this model')
+        raise NotImplementedError("Block swapping is not implemented for this model")
 
     def prepare_block_swap_training(self):
         pass

@@ -132,8 +132,11 @@ class Saver:
             if need_to_checkpoint(self.config, epoch):
                 self.save_checkpoint(step)
                 checkpointed = True
-            if epoch % self.config['save_every_n_epochs'] == 0:
-                self.save_model(f'epoch{epoch}')
+            # if epoch % self.config['save_every_n_epochs'] == 0:
+            #     self.save_model(f'epoch{epoch}')
+            #     saved = True
+            if step % self.config['save_every_n_steps'] == 0:
+                self.save_model(f'step{step}')
                 saved = True
             epoch = self.train_dataloader.epoch
             if epoch > self.config['epochs']:

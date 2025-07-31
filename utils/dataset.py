@@ -3,7 +3,8 @@ import os.path
 import random
 from collections import defaultdict
 import math
-import os
+import os, sys
+sys.path.append("/home/jovyan/dmitrienko/workspace/diffusion-pipe_dmitrienko")
 import hashlib
 
 import numpy as np
@@ -735,7 +736,8 @@ class DatasetManager:
             queue = [manager.Queue()]
         else:
             queue = [None]
-        torch.distributed.broadcast_object_list(queue, src=0, group=dist.get_world_group())
+        if  dist.is_initialized():
+            torch.distributed.broadcast_object_list(queue, src=0, group=dist.get_world_group())
         queue = queue[0]
 
         # start up a process to run through the dataset caching flow
@@ -772,10 +774,10 @@ class DatasetManager:
                     model.to('cpu')
                 else:
                     model.to('meta')
-
-        dist.barrier()
-        if is_main_process():
-            process.join()
+        if  dist.is_initialized():
+            dist.barrier()
+            if is_main_process():
+                process.join()
 
         # Now load all datasets from cache.
         for ds in self.datasets:
@@ -984,13 +986,16 @@ if __name__ == '__main__':
     from utils import dataset as dataset_util
     dataset_util.DEBUG = True
 
-    from models import flux
-    model = flux.CustomFluxPipeline.from_pretrained('/data2/imagegen_models/FLUX.1-dev', torch_dtype=torch.bfloat16)
+    from models import wan
+    import json, toml
+    with open("/home/jovyan/dmitrienko/workspace/diffusion-pipe_dmitrienko/examples/nocfg_camera/wan14b-nocfg_r128a8_dolly_in_lr1e-4_2loras.toml") as f:
+        config = json.loads(json.dumps(toml.load(f)))
+    model = wan.WanPipeline(config)
     model.model_config = {'guidance': 1.0, 'dtype': torch.bfloat16}
 
     import toml
     dataset_manager = dataset_util.DatasetManager(model)
-    with open('/home/anon/code/diffusion-pipe-configs/datasets/tiny1.toml') as f:
+    with open('/home/jovyan/dmitrienko/workspace/diffusion-pipe_dmitrienko/examples/dataset_nocfg/dataset_dolly_in_480_speedup.toml') as f:
         dataset_config = toml.load(f)
     train_data = dataset_util.Dataset(dataset_config, model)
     dataset_manager.register(train_data)
