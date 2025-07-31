@@ -1,6 +1,4 @@
-torch
-torchvision
-deepspeed
+deepspeed==0.17.0
 toml
 transformers
 diffusers>=0.32.1
@@ -27,3 +25,4 @@ hydra-core
 easydict
 ftfy
 pytorch-optimizer
+wandb

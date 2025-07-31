@@ -1,5 +1,6 @@
 import argparse
 import os
+import wandb
 from datetime import datetime, timezone
 import shutil
 import glob
@@ -8,6 +9,7 @@ import random
 import json
 import inspect
 from pathlib import Path
+from collections import defaultdict
 
 import toml
 import deepspeed
@@ -29,7 +31,10 @@ from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
 
-MULTILORA_PATCH = True
+# needed for broadcasting Queue in dataset.py
+mp.current_process().authkey = b'afsaskgfdjh4'
+
+wandb_enable = False
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -39,13 +44,32 @@ parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
 parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
                     help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
-parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
-parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
-parser.add_argument('--i_know_what_i_am_doing', action='store_true', default=None, help="Skip certain checks and overrides. You may end up using settings that won't work.")
+parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
+parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
+parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
+parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
+
+
+class DummyOptimizer(torch.optim.Optimizer):
+    def __init__(self):
+        self.state = defaultdict(dict)
+        self.param_groups = []
+
+    def step(self, closure=None):
+        pass
+
+    def zero_grad(self, set_to_none: bool = True):
+        pass
+
+    def state_dict(self):
+        return {}
+
+    def load_state_dict(self, state_dict):
+        pass
 
 
 # Monkeypatch this so it counts all layer parameters, not just trainable parameters.
@@ -68,7 +92,9 @@ def set_config_defaults(config):
 
     config.setdefault('pipeline_stages', 1)
     config.setdefault('activation_checkpointing', False)
-    config['reentrant_activation_checkpointing'] = (config['activation_checkpointing'] == 'unsloth')
+    config.setdefault('reentrant_activation_checkpointing', False)
+    if config['activation_checkpointing'] == 'unsloth':
+        config['reentrant_activation_checkpointing'] = True
     config.setdefault('warmup_steps', 0)
     if 'save_dtype' in config:
         config['save_dtype'] = DTYPE_MAP[config['save_dtype']]
@@ -76,8 +102,8 @@ def set_config_defaults(config):
     model_config = config['model']
     model_dtype_str = model_config['dtype']
     model_config['dtype'] = DTYPE_MAP[model_dtype_str]
-    if 'transformer_dtype' in model_config:
-        model_config['transformer_dtype'] = DTYPE_MAP[model_config['transformer_dtype']]
+    if transformer_dtype := model_config.get('transformer_dtype', None):
+        model_config['transformer_dtype'] = DTYPE_MAP.get(transformer_dtype, transformer_dtype)
     model_config.setdefault('guidance', 1.0)
 
     if 'adapter' in config:
@@ -103,6 +129,7 @@ def set_config_defaults(config):
     config.setdefault('eval_every_n_steps', None)
     config.setdefault('eval_every_n_epochs', None)
     config.setdefault('eval_before_first_step', True)
+    config.setdefault('compile', False)
 
 
 def get_most_recent_run_dir(output_dir):
@@ -123,16 +150,26 @@ def print_model_info(model):
             print()
 
 
+# Need to preload all micro batches since pulling from the dataloader does IPC between the
+# first and last stage. Can't do that during the train or inference pipeline schedule execution
+# because it conflicts with the send / recv steps.
+def get_data_iterator_for_step(dataloader, engine, num_micro_batches=None):
+    num_micro_batches = num_micro_batches or engine.micro_batches
+    if not (engine.is_first_stage() or engine.is_last_stage()):
+        return None
+    dataloader_iter = iter(dataloader)
+    items = [next(dataloader_iter) for _ in range(num_micro_batches)]
+    return iter(items)
+
+
 def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=None):
     eval_dataloader.set_eval_quantile(quantile)
-    orig_micro_batches = model_engine.micro_batches
-    model_engine.micro_batches = eval_gradient_accumulation_steps
-    iterator = iter(eval_dataloader)
     total_loss = 0
     count = 0
     while True:
         model_engine.reset_activation_shape()
-        loss = model_engine.eval_batch(iterator).item()
+        iterator = get_data_iterator_for_step(eval_dataloader, model_engine, num_micro_batches=eval_gradient_accumulation_steps)
+        loss = model_engine.eval_batch(iterator, num_micro_batches=eval_gradient_accumulation_steps).item()
         eval_dataloader.sync_epoch()
         if pbar:
             pbar.update(1)
@@ -142,7 +179,6 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
             break
 
     eval_dataloader.reset()
-    model_engine.micro_batches = orig_micro_batches
     return total_loss / count
 
 
@@ -164,13 +200,19 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             losses.append(loss)
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
+                if wandb_enable:
+                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
+            if wandb_enable:
+                wandb.log({f'{name}/loss': avg_loss, 'step': step})
 
     duration = time.time() - start
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
+        if wandb_enable:
+            wandb.log({'eval/eval_time_sec': duration, 'step': step})
         pbar.close()
 
 
@@ -208,9 +250,20 @@ def get_prodigy_d(optimizer):
         d += group['d']
     return d / len(optimizer.param_groups)
 
+
+def _get_automagic_lrs(optimizer):
+    lrs = []
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            state = optimizer.state[p]
+            lr = optimizer._get_lr(group, state)
+            lrs.append(lr)
+    lrs = torch.stack(lrs)
+    return lrs, lrs.mean()
+
+
 if __name__ == '__main__':
-    # needed for broadcasting Queue in dataset.py
-    mp.current_process().authkey = b'afsaskgfdjh4'
+    apply_patches()
 
     with open(args.config) as f:
         # Inline TOML tables are not pickleable, which messes up the multiprocessing dataset stuff. This is a workaround.
@@ -219,6 +272,9 @@ if __name__ == '__main__':
     set_config_defaults(config)
     apply_patches(multilora_patch=bool('old_adapter' in config ))
     common.AUTOCAST_DTYPE = config['model']['dtype']
+    dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
+    if map_num_proc := config.get('map_num_proc', None):
+        dataset_util.NUM_PROC = map_num_proc
 
     # Initialize distributed environment before deepspeed
     world_size, rank, local_rank = distributed_init(args)
@@ -259,11 +315,23 @@ if __name__ == '__main__':
         from models import lumina_2
         model = lumina_2.Lumina2Pipeline(config)
     elif model_type == 'wan':
-        from models import wan
+        from models.wan import wan
         model = wan.WanPipeline(config)
     elif model_type == 'chroma':
         from models import chroma
         model = chroma.ChromaPipeline(config)
+    elif model_type == 'hidream':
+        from models import hidream
+        model = hidream.HiDreamPipeline(config)
+    elif model_type == 'sd3':
+        from models import sd3
+        model = sd3.SD3Pipeline(config)
+    elif model_type == 'cosmos_predict2':
+        from models import cosmos_predict2
+        model = cosmos_predict2.CosmosPredict2Pipeline(config)
+    elif model_type == 'omnigen2':
+        from models import omnigen2
+        model = omnigen2.OmniGen2Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -287,7 +355,7 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
@@ -355,6 +423,7 @@ if __name__ == '__main__':
                     1,
                     1,
                     1,
+                    1,
                 )
                 for i, item in enumerate(train_data):
                     latents = item['latents']
@@ -419,14 +488,9 @@ if __name__ == '__main__':
             model.transformer.state_dict()[key].copy_(value)
     # print( model.transformer)
     if adapter_config := config.get('adapter', None):
-        init_from_existing = adapter_config.get('init_from_existing', None)
-        # SDXL is special. LoRAs are saved in Kohya sd-scripts format, which is very difficult to load the state_dict into
-        # an adapter we already configured. So, for SDXL, load_adapter_weights will use a Diffusers method to create and
-        # load the adapter all at once from the sd-scripts format safetensors file.
-        if not (init_from_existing and model_type == 'sdxl'):
-            model.configure_adapter(adapter_config)
+        model.configure_adapter(adapter_config)
         is_adapter = True
-        if init_from_existing:
+        if init_from_existing := adapter_config.get('init_from_existing', None):
             model.load_adapter_weights(init_from_existing)
     else:
         is_adapter = False
@@ -436,6 +500,9 @@ if __name__ == '__main__':
         run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
         os.makedirs(run_dir, exist_ok=True)
         shutil.copy(args.config, run_dir)
+        shutil.copy(config['dataset'], run_dir)
+        for eval_dataset in config['eval_datasets']:
+            shutil.copy(eval_dataset['config'], run_dir)
     # wait for all processes then get the most recent dir (may have just been created)
     dist.barrier()
     if resume_from_checkpoint is True:  # No specific folder provided, use most recent
@@ -453,6 +520,24 @@ if __name__ == '__main__':
     os.makedirs(run_dir, exist_ok=True)
     shutil.copy(args.config, run_dir)
     print(f'run_dir={run_dir} after init')
+    else:  # Not resuming, use most recent (newly created) dir
+        run_dir = get_most_recent_run_dir(config['output_dir'])
+
+    # WandB logging
+    wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
+    if wandb_enable and is_main_process():
+        wandb_api_key     = config['monitoring']['wandb_api_key']
+        wandb_tracker     = config['monitoring']['wandb_tracker_name']
+        wandb_run_name    = config['monitoring']['wandb_run_name']
+        logging_dir       = run_dir
+        wandb.login(key=wandb_api_key)
+        wandb.init(
+            project=wandb_tracker,
+            name=wandb_run_name,
+            config=config,
+            dir=logging_dir
+        )
+
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
@@ -472,7 +557,7 @@ if __name__ == '__main__':
             # weights end up on CPU where they shouldn't. Why? Are we giving anything up by not using the Deepspeed implementation?
             #checkpoint_func = deepspeed.checkpointing.non_reentrant_checkpoint
             from functools import partial
-            checkpoint_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+            checkpoint_func = partial(torch.utils.checkpoint.checkpoint, use_reentrant=config['reentrant_activation_checkpointing'])
         elif activation_checkpointing == 'unsloth':
             checkpoint_func = unsloth_checkpoint
         else:
@@ -496,7 +581,13 @@ if __name__ == '__main__':
     )
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
+    if config['compile']:
+        pipeline_model.compile()
+
     def get_optimizer(model_parameters):
+        if len(model_parameters) == 0:
+            return DummyOptimizer()
+
         optim_config = config['optimizer']
         optim_type = optim_config['type']
         optim_type_lower = optim_type.lower()
@@ -528,6 +619,12 @@ if __name__ == '__main__':
             klass = CPUOffloadOptimizer
             args.append(torch.optim.AdamW)
             kwargs['fused'] = True
+        elif optim_type_lower == 'automagic':
+            from optimizers import automagic
+            klass = automagic.Automagic
+        elif optim_type_lower == 'genericoptim':
+            from optimizers import generic_optim
+            klass = generic_optim.GenericOptim
         else:
             import pytorch_optimizer
             klass = getattr(pytorch_optimizer, optim_type)
@@ -590,9 +687,34 @@ if __name__ == '__main__':
 
             from optimizers import gradient_release
             return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
+        elif optim_type_lower == 'genericoptim':
+            kwargs['compile'] = config['compile']
+            new_param_groups = []
+            param_groups = model.get_param_groups(model_parameters)
+            for pg in param_groups:
+                params = pg.pop('params')
+                params_2d = []
+                params_other = []
+                for p in params:
+                    if p.ndim == 2:
+                        params_2d.append(p)
+                    else:
+                        params_other.append(p)
+                pg_2d = pg.copy()
+                pg_2d['params'] = params_2d
+                if kwargs.get('second_moment_type', None) == 'sn':
+                    pg_2d['subset_size'] = 'heuristics'
+                for key in ('rank', 'proj_type', 'update_proj_gap'):
+                    if key in kwargs:
+                        pg_2d[key] = kwargs.pop(key)
+                new_param_groups.append(pg_2d)
+                pg_other = pg
+                pg_other['params'] = params_other
+                new_param_groups.append(pg_other)
+            return klass(new_param_groups, *args, **kwargs)
         else:
-            model_parameters = model.get_param_groups(model_parameters)
-            return klass(model_parameters, *args, **kwargs)
+            param_groups = model.get_param_groups(model_parameters)
+            return klass(param_groups, *args, **kwargs)
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -601,10 +723,10 @@ if __name__ == '__main__':
         optimizer=get_optimizer,
         config=ds_config,
     )
-    if model_engine.is_pipe_parallel:
-        grid = model_engine.grid
-        model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
     model.model_engine = model_engine
+    if model_engine.is_pipe_parallel:
+         grid = model_engine.grid
+         model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
 
     lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     if config['warmup_steps'] > 0:
@@ -618,6 +740,7 @@ if __name__ == '__main__':
         model_engine.grid.get_data_parallel_world_size(),
         model_engine.train_micro_batch_size_per_gpu(),
         model_engine.gradient_accumulation_steps(),
+        config.get('image_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu()),
     )
     for eval_data in eval_data_map.values():
         eval_data.post_init(
@@ -625,6 +748,7 @@ if __name__ == '__main__':
             model_engine.grid.get_data_parallel_world_size(),
             config.get('eval_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu()),
             config['eval_gradient_accumulation_steps'],
+            config.get('image_eval_micro_batch_size_per_gpu', config.get('eval_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu())),
         )
 
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.
@@ -656,13 +780,10 @@ if __name__ == '__main__':
         for pg in optimizer.param_groups:
             pg['lr'] = config['force_constant_lr']
 
-    model_engine.set_dataloader(train_dataloader)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
     model_engine.total_steps = steps_per_epoch * config['epochs']
 
     eval_dataloaders = {
-        # Set num_dataloader_workers=0 so dataset iteration is completely deterministic.
-        # We want the exact same noise for each image, each time, for a stable validation loss.
         name: dataset_util.PipelineDataLoader(eval_data, model_engine, config['eval_gradient_accumulation_steps'], model, num_dataloader_workers=0)
         for name, eval_data in eval_data_map.items()
     }
@@ -679,10 +800,11 @@ if __name__ == '__main__':
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0
     num_steps = 0
+    empty_cuda_cache()
     while True:
-        #empty_cuda_cache()
         model_engine.reset_activation_shape()
-        loss = model_engine.train_batch().item()
+        iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+        loss = model_engine.train_batch(iterator).item()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
@@ -692,9 +814,15 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, step)
+            if wandb_enable:
+                wandb.log({'train/loss': loss, 'step': step})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, step)
+            if optimizer.__class__.__name__ == 'Automagic':
+                lrs, avg_lr = _get_automagic_lrs(optimizer)
+                tb_writer.add_histogram(f'train/automagic_lrs', lrs, step)
+                tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, step)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, step, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
@@ -702,6 +830,8 @@ if __name__ == '__main__':
         if finished_epoch:
             if is_main_process():
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+                if wandb_enable:
+                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
             epoch_loss = 0
             num_steps = 0
             epoch = new_epoch
