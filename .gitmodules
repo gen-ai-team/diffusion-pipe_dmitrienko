@@ -10,3 +10,6 @@
 [submodule "submodules/flow"]
 	path = submodules/flow
 	url = https://github.com/lodestone-rock/flow
+[submodule "submodules/Wan2_1_dmitrienko"]
+	path = submodules/Wan2_1_dmitrienko
+	url = https://github.com/gen-ai-team/Wan2.1_dmitrienko
