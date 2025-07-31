@@ -517,9 +517,9 @@ if __name__ == '__main__':
         run_dir = run_dir.replace('training_log.txt', '')
     if not run_dir.split('-')[-1].isdigit():
         run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
-    os.makedirs(run_dir, exist_ok=True)
-    shutil.copy(args.config, run_dir)
-    print(f'run_dir={run_dir} after init')
+        os.makedirs(run_dir, exist_ok=True)
+        shutil.copy(args.config, run_dir)
+        print(f'run_dir={run_dir} after init')
     else:  # Not resuming, use most recent (newly created) dir
         run_dir = get_most_recent_run_dir(config['output_dir'])
 

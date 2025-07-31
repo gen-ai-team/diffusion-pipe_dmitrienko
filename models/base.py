@@ -110,11 +110,6 @@ class PreprocessMediaFile:
             tar_f = self.tarfile_map.setdefault(tar_filename, tarfile.TarFile(tar_filename))
             filepath_or_file = tar_f.extractfile(str(spec[1]))
 
-<<<<<<< HEAD
-    def __call__(self, filepath, mask_filepath, size_bucket=None):
-        is_video = Path(filepath).suffix in VIDEO_EXTENSIONS
-=======
->>>>>>> upstream/main
         if is_video:
             assert self.support_video
             num_frames = 0
@@ -210,49 +205,34 @@ class BasePipeline:
         adapter_type = adapter_config["type"]
         if adapter_type == "lora":
             for target_modules in [self.adapter_target_modules, target_linear_modules,  ]:
-                #try:
-                print(f' self.adapter_target_modules={ self.adapter_target_modules}, target_linear_modules={target_linear_modules}')
-                peft_config = peft.LoraConfig(
-                    r=adapter_config["rank"],
-                    lora_alpha=adapter_config["alpha"],
-                    lora_dropout=adapter_config["dropout"],
-                    bias="none",
-                    target_modules=target_modules,
-                    inference_mode=False, 
-                )
-                self.peft_config = peft_config
-                if not isinstance(self.transformer, peft.PeftModel):
-                    self.lora_model = peft.get_peft_model(self.transformer, peft_config)
-                else:
-                    # self.transformer.add_adapter("camera", peft_config)
-                    # self.transformer.set_adapter("camera")
-                    self.lora_model = peft.get_peft_model(self.transformer, peft_config, adapter_name='default')
-                    # self.lora_model = self.transformer
-                    print("active_adapters", self.lora_model.active_adapters)
-                    print("all adapters", self.lora_model.peft_config.keys())
-                    for name, param in self.lora_model.named_parameters():
-                        if "default" in name and "lora" in name:
-                            param.requires_grad_(True)
-                        elif "nocfg" in name:
-                            param.requires_grad_(False)
-                    # self.lora_model.set_adapter([ "nocfg", "default",])
-                    # # 3. Альтернатива set_adapter() для нескольких адаптеров:
-                    # def set_multiple_adapters(model, adapter_names):
-                    #     for module in model.modules():
-                    #         if isinstance(module, peft.LoraLayer):
-                    #             if module.merged:
-                    #                 module.unmerge()
-                    #             module.set_adapter(adapter_names)
-                    #             module.active_adapters = adapter_names
-                    #     model.active_adapter = adapter_names
-                    #     model.active_adapters = adapter_names
-
-                    # # Устанавливаем оба адаптера активными
-                    # set_multiple_adapters(self.lora_model, ["nocfg", "camera", ])
-                    # print("active_adapters after set_multiple_adapters", self.lora_model.active_adapters)
-                break
-                # except Exception as e:
-                #     print(f'[models.base.configure_adapter] : {e}')
+                try:
+                    print(f' self.adapter_target_modules={ self.adapter_target_modules}, target_linear_modules={target_linear_modules}')
+                    peft_config = peft.LoraConfig(
+                        r=adapter_config["rank"],
+                        lora_alpha=adapter_config["alpha"],
+                        lora_dropout=adapter_config["dropout"],
+                        bias="none",
+                        target_modules=target_modules,
+                        inference_mode=False, 
+                    )
+                    self.peft_config = peft_config
+                    if not isinstance(self.transformer, peft.PeftModel):
+                        self.lora_model = peft.get_peft_model(self.transformer, peft_config)
+                    else:
+                        # self.transformer.add_adapter("camera", peft_config)
+                        # self.transformer.set_adapter("camera")
+                        self.lora_model = peft.get_peft_model(self.transformer, peft_config, adapter_name='default')
+                        # self.lora_model = self.transformer
+                        print("active_adapters", self.lora_model.active_adapters)
+                        print("all adapters", self.lora_model.peft_config.keys())
+                        for name, param in self.lora_model.named_parameters():
+                            if "default" in name and "lora" in name:
+                                param.requires_grad_(True)
+                            elif "nocfg" in name:
+                                param.requires_grad_(False)
+                        
+                except Exception as e:
+                    print(f'[models.base.configure_adapter] : {e}')
         else:
             raise NotImplementedError(f"Adapter type {adapter_type} is not implemented")
         

@@ -22,8 +22,8 @@ except ModuleNotFoundError:
 from deepspeed.accelerator import get_accelerator
 
 from . import reduction
-import hyvideo.text_encoder
-from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+# import hyvideo.text_encoder
+# from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
@@ -328,8 +328,41 @@ def copy_args_to_cpu_if_needed(self, *args, **kwargs):
 
     return copies
 
+from peft.tuners.lora.layer import Linear
+original_forward = Linear.forward
 
-def apply_patches():
+def patched_forward(self, x, *args, **kwargs):
+    # kwargs["adapter_names"] = kwargs.get("adapter_names", list(self.lora_A.keys()))
+    
+    # This is a special method that handles the case when users pass the argument `adapter_names`. This is an
+    # extra argument that allows mixing different adapters in the same batch at inference time.
+    result = self.base_layer(x, *args, **kwargs)
+    torch_result_dtype = result.dtype
+
+    unique_adapters = list(self.lora_A.keys()) #set(adapter_names)
+
+    for i, active_adapter in enumerate(unique_adapters):
+        if active_adapter == "__base__":
+            continue
+        if active_adapter not in self.lora_A.keys():
+            continue
+        lora_A = self.lora_A[active_adapter]
+        lora_B = self.lora_B[active_adapter]
+        dropout = self.lora_dropout[active_adapter]
+        scaling = self.scaling[active_adapter]
+
+        # getting the sub-batch, passing it to LoRA layers and updating the corresponding indices of the linear
+        # layer output
+        batch = x.to(lora_A.weight.dtype)
+        lora_output = lora_B(lora_A(dropout(batch))) * scaling
+        result += lora_output.to(torch_result_dtype)
+
+    return result
+
+def apply_patches(multilora_patch=False):
+    if multilora_patch:
+        Linear.forward = patched_forward
+
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
     peft.tuners.tuners_utils.BaseTunerLayer._move_adapter_to_device_of_base_layer = _move_adapter_to_device_of_base_layer
@@ -356,4 +389,4 @@ def apply_patches():
     reduction.init_reductions()
 
     # Remove pin_memory=True which is causing failures in some cases when using torch compile.
-    torch._inductor.runtime.triton_heuristics.CachingAutotuner.copy_args_to_cpu_if_needed = copy_args_to_cpu_if_needed
+    # torch._inductor.runtime.triton_heuristics.CachingAutotuner.copy_args_to_cpu_if_needed = copy_args_to_cpu_if_needed
